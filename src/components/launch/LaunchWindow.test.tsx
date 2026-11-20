@@ -10,12 +10,10 @@ import type { NativePlatform } from "@/native/contracts";
 import { TooltipProvider } from "../ui/tooltip";
 import {
 	HUD_BAR_BOTTOM,
-	HUD_EDGE_SLACK,
 	HUD_POPOVER_GAP,
 	HUD_POPOVER_MAX_HEIGHT,
 	HUD_STACK_GAP,
 	HUD_TOAST_WIDTH,
-	HUD_TOOLTIP_STACK_HEIGHT,
 	HUD_UNREPORTED_PANELS_ALLOWANCE,
 } from "./hudGeometry";
 import { LaunchWindow } from "./LaunchWindow";
@@ -1316,12 +1314,11 @@ describe("LaunchWindow overlay sizing", () => {
 		});
 
 		const [width, height] = lastRequestedHudSize();
-		// The bar plus the edge slack, and nothing more: on Linux the HUD is not
-		// click-through, so extra width is a transparent dead zone around the bar.
-		expect(width).toBe(400 + HUD_EDGE_SLACK * 2);
-		// The height keeps room for the tallest tooltip (portalled, so never measured)
-		// and nothing for the panels that are not open.
-		expect(height).toBe(HUD_BAR_BOTTOM + 56 + HUD_TOOLTIP_STACK_HEIGHT + HUD_EDGE_SLACK);
+		// The bar and nothing more: on Linux the HUD is not click-through, so extra
+		// width is a transparent dead zone around the bar.
+		expect(width).toBe(400);
+		// No room for panels that are not open, nor a margin above or under the bar.
+		expect(height).toBe(56);
 	});
 
 	it("shrinks back to the bar on Linux once a wider bar narrows", async () => {
@@ -1334,14 +1331,14 @@ describe("LaunchWindow overlay sizing", () => {
 		stubBox(bar, 520, 56);
 		await flushResizeObservers();
 		await waitFor(() => {
-			expect(lastRequestedHudSize()[0]).toBe(520 + HUD_EDGE_SLACK * 2);
+			expect(lastRequestedHudSize()[0]).toBe(520);
 		});
 
 		stubBox(bar, 400, 56);
 		await flushResizeObservers();
 		// No shrink threshold without a reserve: the window follows the bar down
 		// instead of keeping a click-blocking margin.
-		expect(lastRequestedHudSize()[0]).toBe(400 + HUD_EDGE_SLACK * 2);
+		expect(lastRequestedHudSize()[0]).toBe(400);
 	});
 
 	it("grows for an open panel on Linux and shrinks back once it closes", async () => {
@@ -1352,7 +1349,7 @@ describe("LaunchWindow overlay sizing", () => {
 			"[data-tray-layout]",
 		) as HTMLElement;
 		const anchor = bar.parentElement as HTMLElement;
-		const collapsed = HUD_BAR_BOTTOM + 56 + HUD_TOOLTIP_STACK_HEIGHT + HUD_EDGE_SLACK;
+		const collapsed = 56;
 		stubBox(bar, 400, 56);
 		await flushResizeObservers();
 		expect(lastRequestedHudSize()[1]).toBe(collapsed);
@@ -1362,7 +1359,7 @@ describe("LaunchWindow overlay sizing", () => {
 		const stack = 56 + HUD_POPOVER_GAP + 300;
 		stubBox(anchor, 400, stack);
 		await flushResizeObservers();
-		expect(lastRequestedHudSize()[1]).toBe(HUD_BAR_BOTTOM + stack + HUD_EDGE_SLACK);
+		expect(lastRequestedHudSize()[1]).toBe(stack);
 
 		stubBox(anchor, 400, 56);
 		await flushResizeObservers();
@@ -1378,7 +1375,7 @@ describe("LaunchWindow overlay sizing", () => {
 		) as HTMLElement;
 		stubBox(bar, 400, 56);
 		await flushResizeObservers();
-		const collapsed = HUD_BAR_BOTTOM + 56 + HUD_TOOLTIP_STACK_HEIGHT + HUD_EDGE_SLACK;
+		const collapsed = 56;
 		expect(lastRequestedHudSize()[1]).toBe(collapsed);
 
 		act(() => {

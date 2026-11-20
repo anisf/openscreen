@@ -1,6 +1,6 @@
 //! H.264 encoding and MP4 muxing for the captured screen.
 //!
-//! THE LADDER. Three backends are tried in order and the first one that actually
+//! THE LADDER. Four backends are tried in order and the first one that actually
 //! opens wins. "Actually opens" is the whole point: `avcodec_find_encoder_by_name`
 //! succeeds for every encoder compiled into the library, including ones this
 //! machine's GPU cannot run, so the only honest capability probe is to open the
@@ -29,13 +29,14 @@ use crate::ffmpeg as ff;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
+    Nvenc,
     Vaapi,
     Vulkan,
     Software,
 }
 
 /// Whether the dmabuf → VAAPI zero-copy import may be used for a `forced` encoder
-/// choice. The import can only feed VAAPI, so `software`/`vulkan` must skip it —
+/// choice. The import can only feed VAAPI, so software, Vulkan, and NVENC skip it —
 /// otherwise the documented `OPENSCREEN_LINUX_ENCODER` override is silently
 /// ignored on the dmabuf path.
 ///
@@ -51,6 +52,7 @@ impl Backend {
     /// vocabulary as the Windows helper's `encoder-selection` event.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Nvenc => "nvenc",
             Self::Vaapi => "vaapi",
             Self::Vulkan => "vulkan",
             Self::Software => "software",
@@ -59,6 +61,7 @@ impl Backend {
 
     fn codec_name(self) -> &'static CStr {
         match self {
+            Self::Nvenc => c"h264_nvenc",
             Self::Vaapi => c"h264_vaapi",
             Self::Vulkan => c"h264_vulkan",
             Self::Software => c"libopenh264",
@@ -67,6 +70,7 @@ impl Backend {
 
     fn hw_device_type(self) -> Option<ff::AVHWDeviceType> {
         match self {
+            Self::Nvenc => Some(ff::AV_HWDEVICE_TYPE_CUDA),
             Self::Vaapi => Some(ff::AV_HWDEVICE_TYPE_VAAPI),
             Self::Vulkan => Some(ff::AV_HWDEVICE_TYPE_VULKAN),
             Self::Software => None,
@@ -77,6 +81,7 @@ impl Backend {
     /// opaque handle; the real pixels live in [`Self::upload_format`].
     fn codec_pixel_format(self) -> ff::AVPixelFormat {
         match self {
+            Self::Nvenc => ff::AV_PIX_FMT_CUDA,
             Self::Vaapi => ff::AV_PIX_FMT_VAAPI,
             Self::Vulkan => ff::AV_PIX_FMT_VULKAN,
             Self::Software => ff::AV_PIX_FMT_YUV420P,
@@ -86,9 +91,7 @@ impl Backend {
     /// What swscale converts the captured RGB into.
     fn upload_format(self) -> ff::AVPixelFormat {
         match self {
-            // Every VCN/QuickSync/NVENC block wants NV12; YUV420P would force
-            // ffmpeg into an extra internal conversion on upload.
-            Self::Vaapi | Self::Vulkan => ff::AV_PIX_FMT_NV12,
+            Self::Nvenc | Self::Vaapi | Self::Vulkan => ff::AV_PIX_FMT_NV12,
             Self::Software => ff::AV_PIX_FMT_YUV420P,
         }
     }
@@ -118,19 +121,19 @@ impl Backend {
     /// out at 5.6 instead of 4.2), the right trade for a file the editor
     /// re-encodes.
     ///
-    /// VAAPI only, because VAAPI is where it was measured. Vulkan (rung 2) and
+    /// VAAPI only, because VAAPI is where it was measured. NVENC, Vulkan, and
     /// libopenh264 keep their defaults.
     fn max_qp(self) -> Option<i32> {
         match self {
             Self::Vaapi => Some(30),
-            Self::Vulkan | Self::Software => None,
+            Self::Nvenc | Self::Vulkan | Self::Software => None,
         }
     }
 }
 
 /// Order of preference. Public so the probe can be driven from a test or from
 /// `OPENSCREEN_LINUX_ENCODER` without duplicating the list.
-pub const LADDER: [Backend; 3] = [Backend::Vaapi, Backend::Vulkan, Backend::Software];
+pub const LADDER: [Backend; 4] = [Backend::Nvenc, Backend::Vaapi, Backend::Vulkan, Backend::Software];
 
 /// Must run before anything creates a Vulkan instance — which, in this process,
 /// means before the first `av_hwdevice_ctx_create`.
@@ -156,6 +159,14 @@ pub fn prepare_environment() {
 
     add_flag("RADV_PERFTEST", "video_encode");
     add_flag("RADV_EXPERIMENTAL", "video_encode");
+}
+
+/// Convert the optional render-node override into the C string FFmpeg expects.
+fn vaapi_device_path(path: Option<&str>) -> Result<Option<CString>, String> {
+    path.map(|path| {
+        CString::new(path).map_err(|_| "OPENSCREEN_LINUX_RENDER_NODE contains a NUL byte".to_owned())
+    })
+    .transpose()
 }
 
 /// True when libva is new enough that libavutil's VA-API code will not abort.
@@ -355,6 +366,21 @@ pub struct VideoParams {
     pub bitrate: i64,
 }
 
+/// H.264 hardware encoding is limited to 4096 pixels on either axis. Preserve
+/// aspect ratio and even dimensions for 4:2:0 chroma when reducing larger captures.
+pub fn h264_output_dimensions(width: i32, height: i32) -> (i32, i32) {
+    const MAX_DIMENSION: i32 = 4096;
+    let width = width.max(2) & !1;
+    let height = height.max(2) & !1;
+    let scale = (f64::from(MAX_DIMENSION) / f64::from(width))
+        .min(f64::from(MAX_DIMENSION) / f64::from(height))
+        .min(1.0);
+    let output_width = ((f64::from(width) * scale).floor() as i32).max(2) & !1;
+    let output_height = ((f64::from(height) * scale).floor() as i32).max(2) & !1;
+    (output_width, output_height)
+}
+
+
 /// Where the per-frame time actually goes.
 ///
 /// Not debug scaffolding: the capture loop has a hard real-time budget (16.7 ms
@@ -444,7 +470,9 @@ impl VideoEncoder {
 
         let candidates: Vec<Backend> = match forced {
             Some(backend) => vec![backend],
-            None => LADDER.to_vec(),
+            None => {
+                LADDER.to_vec()
+            }
         };
 
         let mut failures = Vec::new();
@@ -643,10 +671,25 @@ impl VideoEncoder {
             return Ok(());
         }
 
+        // On hybrid-graphics systems libva may default to the first render node,
+        // which is not necessarily the GPU that can encode. The launcher can pin
+        // OpenScreen to the same node used by the dmabuf importer.
+        let device_path = match device_type {
+            ff::AV_HWDEVICE_TYPE_VAAPI => {
+                let path = std::env::var("OPENSCREEN_LINUX_RENDER_NODE").ok();
+                vaapi_device_path(path.as_deref())?
+            }
+            ff::AV_HWDEVICE_TYPE_CUDA => {
+                let path = std::env::var("OPENSCREEN_LINUX_CUDA_DEVICE").ok();
+                vaapi_device_path(path.as_deref())?
+            }
+            _ => None,
+        };
+        let device_name = device_path.as_ref().map_or(ptr::null(), |path| path.as_ptr());
         let created = ff::av_hwdevice_ctx_create(
             &mut self.hw_device,
             device_type,
-            ptr::null(),
+            device_name,
             ptr::null_mut(),
             0,
         );
@@ -745,6 +788,18 @@ impl VideoEncoder {
         stride: usize,
         src_format: ff::AVPixelFormat,
     ) -> Result<(), String> {
+        self.stage_sized(pixels, stride, src_format, self.params.width, self.params.height)
+    }
+
+    /// Stages a full-resolution source image and scales to this encoder's output size.
+    pub fn stage_sized(
+        &mut self,
+        pixels: &[u8],
+        stride: usize,
+        src_format: ff::AVPixelFormat,
+        source_width: i32,
+        source_height: i32,
+    ) -> Result<(), String> {
         // Before anything is touched, `hw_staged` above all: `Capture::finish`
         // re-sends that last imported surface as its tail write, so refusing here
         // ends the recording with a playable file instead of a core dump.
@@ -760,24 +815,22 @@ impl VideoEncoder {
         // window crop produces: `pixels` there starts partway into the buffer, so
         // the tail is short by the offset even though every row is complete.
         let needed = stride
-            .checked_mul(self.params.height.saturating_sub(1) as usize)
-            .and_then(|rows| {
-                rows.checked_add(self.params.width as usize * BYTES_PER_SOURCE_PIXEL)
-            })
+            .checked_mul(source_height.saturating_sub(1) as usize)
+            .and_then(|rows| rows.checked_add(source_width as usize * BYTES_PER_SOURCE_PIXEL))
             .ok_or_else(|| "frame size overflows".to_owned())?;
         if pixels.len() < needed {
             return Err(format!(
                 "captured frame is truncated: {} bytes for {} rows of {} px at stride {stride}",
                 pixels.len(),
-                self.params.height,
-                self.params.width
+                source_height,
+                source_width
             ));
         }
 
         // SAFETY: the slice was just bounds-checked against the geometry we hand
         // to swscale, and every ffmpeg pointer below is owned by `self`.
         unsafe {
-            self.ensure_sws(src_format)?;
+            self.ensure_sws(src_format, source_width, source_height)?;
 
             // The staging frame is reused every frame; ffmpeg requires it be
             // writable before we scribble into it, which matters once the
@@ -798,7 +851,7 @@ impl VideoEncoder {
                 src_data.as_ptr(),
                 src_stride.as_ptr(),
                 0,
-                self.params.height,
+                source_height,
                 (*self.sw_frame).data.as_mut_ptr(),
                 (*self.sw_frame).linesize.as_mut_ptr(),
             );
@@ -959,7 +1012,12 @@ impl VideoEncoder {
 
     /// SAFETY: called with `self` valid; rebuilds `self.sws` when the source
     /// format changes.
-    unsafe fn ensure_sws(&mut self, src_format: ff::AVPixelFormat) -> Result<(), String> {
+    unsafe fn ensure_sws(
+        &mut self,
+        src_format: ff::AVPixelFormat,
+        source_width: i32,
+        source_height: i32,
+    ) -> Result<(), String> {
         if !self.sws.is_null() && self.sws_src_format == src_format {
             return Ok(());
         }
@@ -972,18 +1030,16 @@ impl VideoEncoder {
         // it. It is set to 1 by default; see [`sws_thread_count`] for the
         // measurement behind that.
         //
-        // Source and destination are the same size, so no resampling filter is
-        // involved and the cheapest kernel is the right one: this is a pure
-        // colour-space conversion, and a bilinear kernel would cost more for
-        // pixels it never moves.
+        // Use a point kernel for the resize and color conversion. It is fast and
+        // preserves crisp screen edges; dimensions normally match.
         self.sws = ff::sws_alloc_context();
         if self.sws.is_null() {
             return Err("sws_alloc_context returned null".to_owned());
         }
         let dst_format = self.backend.upload_format();
         let options: [(&CStr, i64); 8] = [
-            (c"srcw", self.params.width as i64),
-            (c"srch", self.params.height as i64),
+            (c"srcw", source_width as i64),
+            (c"srch", source_height as i64),
             (c"src_format", src_format as i64),
             (c"dstw", self.params.width as i64),
             (c"dsth", self.params.height as i64),
@@ -1555,11 +1611,12 @@ pub fn forced_backend_from_env() -> Result<Option<Backend>, String> {
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "auto" => Ok(None),
+        "nvenc" => Ok(Some(Backend::Nvenc)),
         "vaapi" => Ok(Some(Backend::Vaapi)),
         "vulkan" => Ok(Some(Backend::Vulkan)),
         "software" | "openh264" | "libopenh264" => Ok(Some(Backend::Software)),
         other => Err(format!(
-            "OPENSCREEN_LINUX_ENCODER={other} is not one of auto, vaapi, vulkan, software"
+            "OPENSCREEN_LINUX_ENCODER={other} is not one of auto, nvenc, vaapi, vaapi-nvidia, vulkan, software"
         )),
     }
 }
@@ -1567,6 +1624,19 @@ pub fn forced_backend_from_env() -> Result<Option<Backend>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vaapi_device_path_preserves_the_render_node_override() {
+        let path = vaapi_device_path(Some("/dev/dri/renderD129")).expect("valid path");
+        assert_eq!(path.as_deref().map(CStr::to_bytes), Some(b"/dev/dri/renderD129".as_slice()));
+    }
+
+    #[test]
+    fn vaapi_device_path_rejects_interior_nul_bytes() {
+        let error = vaapi_device_path(Some("/dev/dri/renderD129\0invalid"))
+            .expect_err("an interior NUL cannot be passed to FFmpeg");
+        assert!(error.contains("OPENSCREEN_LINUX_RENDER_NODE"));
+    }
 
     #[test]
     fn every_ladder_entry_names_a_codec_this_build_has() {
@@ -1634,12 +1704,20 @@ mod tests {
         assert_eq!(Backend::Vulkan.max_qp(), None);
         assert_eq!(Backend::Software.max_qp(), None);
 
+        assert_eq!(h264_output_dimensions(5120, 2160), (4096, 1728));
+        assert_eq!(h264_output_dimensions(3840, 2160), (3840, 2160));
+        assert_eq!(h264_output_dimensions(321, 241), (320, 240));
+
         let params = || VideoParams { width: 320, height: 240, fps: 60, bitrate: 2_000_000 };
         let software = VideoEncoder::open(params(), Some(Backend::Software), |_, _| {})
             .expect("libopenh264 must open");
         // SAFETY: the context is owned by `software`, alive for this read.
         let software_qmax = unsafe { (*software.codec_context()).qmax };
         assert_eq!(software_qmax, -1, "libopenh264 must keep its default ceiling");
+        assert_eq!(Backend::Nvenc.as_str(), "nvenc");
+        assert_eq!(Backend::Nvenc.hw_device_type(), Some(ff::AV_HWDEVICE_TYPE_CUDA));
+        assert_eq!(Backend::Nvenc.codec_pixel_format(), ff::AV_PIX_FMT_CUDA);
+        assert_eq!(Backend::Nvenc.upload_format(), ff::AV_PIX_FMT_NV12);
 
         // Opportunistic: only a machine with a usable VA-API driver can open it,
         // which CI cannot. Where it opens, the cap must have survived avcodec_open2.
@@ -1682,8 +1760,8 @@ mod tests {
     /// portal and no compositor involved.
     ///
     /// Opt-in via `OPENSCREEN_LINUX_ENCODE_TEST=1` because it depends on the
-    /// GPU: on this hardware it selects Vulkan, on a headless CI box it falls
-    /// through to software, and both are correct. Run it after any change to the
+    /// GPU: on this NVIDIA system it selects NVENC; headless CI falls through to
+    /// software. H.264 NVENC is capped at 4096 pixels wide, so this exercises that limit.
     /// ladder, and read the printed backend — that line is the measurement.
     #[test]
     fn ladder_encodes_a_playable_mp4() {
@@ -1691,7 +1769,8 @@ mod tests {
             eprintln!("skipped: set OPENSCREEN_LINUX_ENCODE_TEST=1 to run");
             return;
         }
-        let (width, height, fps) = (1920, 1080, 60);
+        let (source_width, source_height, fps) = (5120, 2160, 60);
+        let (width, height) = h264_output_dimensions(source_width, source_height);
         let output = std::env::temp_dir().join("openscreen-encoder-smoke.mp4");
         let _ = std::fs::remove_file(&output);
 
@@ -1706,8 +1785,8 @@ mod tests {
         let mut muxer = Muxer::create(&output).expect("muxer");
         let track = muxer.add_stream(encoder.codec_context()).expect("video track");
         muxer.write_header().expect("header");
-        let stride = width as usize * 4;
-        let mut frame = vec![0u8; stride * height as usize];
+        let stride = source_width as usize * 4;
+        let mut frame = vec![0u8; stride * source_height as usize];
         let started = std::time::Instant::now();
         const FRAMES: i64 = 120;
         for pts in 0..FRAMES {
@@ -1718,7 +1797,10 @@ mod tests {
                 *byte = ((index as i64 + pts * 7919) % 251) as u8;
             }
             encoder
-                .submit(&frame, stride, ff::AV_PIX_FMT_BGRA, pts, |packet| muxer.write(track, packet))
+                .stage_sized(&frame, stride, ff::AV_PIX_FMT_BGRA, source_width, source_height)
+                .expect("stage source resolution");
+            encoder
+                .encode_staged(pts, |packet| muxer.write(track, packet))
                 .expect("submit");
         }
         encoder.finish(|packet| muxer.write(track, packet)).expect("finish");
@@ -1727,7 +1809,7 @@ mod tests {
 
         let stats = encoder.stats();
         eprintln!(
-            "{FRAMES} frames of {width}x{height} in {:.2}s = {:.0} fps\n  \
+            "{FRAMES} frames of {source_width}x{source_height} -> {width}x{height} in {:.2}s = {:.0} fps\n  \
              convert {:.2} ms/frame ({} swscale threads) | upload {:.2} ms | encode {:.2} ms",
             elapsed.as_secs_f64(),
             FRAMES as f64 / elapsed.as_secs_f64(),
@@ -1739,6 +1821,7 @@ mod tests {
 
         let size = std::fs::metadata(&output).expect("output exists").len();
         assert!(size > 1024, "the muxed file is {size} bytes, which cannot be 120 frames");
+        let _ = std::fs::remove_file(output);
     }
 
     #[test]

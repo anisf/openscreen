@@ -75,7 +75,7 @@ fn sw_format_for_fourcc(drm_fourcc: u32) -> Option<ff::AVPixelFormat> {
 /// When this is true the stream prefers dmabuf; when false it stays on shm.
 pub fn available() -> bool {
     const XRGB8888: u32 = 0x34325258;
-    DmabufImporter::new(1920, 1080, 1920, 1080, XRGB8888).is_ok()
+    DmabufImporter::new(1920, 1080, 1920, 1080, 1920, 1080, XRGB8888).is_ok()
 }
 
 pub struct DmabufImporter {
@@ -83,6 +83,8 @@ pub struct DmabufImporter {
     /// monitor; for a monitor it equals the output size.
     src_width: i32,
     src_height: i32,
+    crop_width: i32,
+    crop_height: i32,
     /// Size of the NV12 the graph emits — the recorded size. For a window this is
     /// the committed crop rectangle; for a monitor it equals the source size.
     out_width: i32,
@@ -104,12 +106,12 @@ pub struct DmabufImporter {
 
 impl DmabufImporter {
     /// Builds the device, frames contexts and `scale_vaapi` graph. `src` is the
-    /// incoming dmabuf size (the whole stream); `out` is the recorded size — equal
-    /// to `src` for a monitor, or the window's crop rectangle for a window (the
-    /// graph then crops the source region down to it, on the GPU).
+    /// incoming dmabuf size, `crop` is the source region, and `out` is its encoded size.
     pub fn new(
         src_width: i32,
         src_height: i32,
+        crop_width: i32,
+        crop_height: i32,
         out_width: i32,
         out_height: i32,
         drm_fourcc: u32,
@@ -122,6 +124,8 @@ impl DmabufImporter {
             let mut me = DmabufImporter {
                 src_width,
                 src_height,
+                crop_width,
+                crop_height,
                 out_width,
                 out_height,
                 sw_format,
@@ -421,8 +425,8 @@ impl DmabufImporter {
             // at 0 (crop_x/y are 0 and out == src), so nothing is cropped.
             (*mapped).crop_left = crop_x.max(0) as usize;
             (*mapped).crop_top = crop_y.max(0) as usize;
-            (*mapped).crop_right = (self.src_width - crop_x - self.out_width).max(0) as usize;
-            (*mapped).crop_bottom = (self.src_height - crop_y - self.out_height).max(0) as usize;
+            (*mapped).crop_right = (self.src_width - crop_x - self.crop_width).max(0) as usize;
+            (*mapped).crop_bottom = (self.src_height - crop_y - self.crop_height).max(0) as usize;
 
             // Push through scale_vaapi → NV12.
             let pushed = ff::av_buffersrc_add_frame(self.buffersrc_ctx, mapped);

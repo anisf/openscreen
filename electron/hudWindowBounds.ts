@@ -121,7 +121,13 @@ export function clampHudBoundsToWorkArea(
 ): EditorWindowRect {
 	return content
 		? clampHudContentToWorkArea(bounds, content, workArea)
-		: clampRectToWorkArea(bounds, workArea, HUD_WINDOW_MIN);
+		: clampRectToWorkArea(
+				bounds,
+				workArea,
+				// Linux sizes the HUD to exactly its visible content (it is not click-through),
+				// so the 120x80 floor would pad a 55px bar with an input-catching strip.
+				process.platform === "linux" ? { width: 1, height: 1 } : HUD_WINDOW_MIN,
+			);
 }
 
 /**

@@ -792,12 +792,8 @@ fn run<W: Write>(
         .output_path
         .as_ref()
         .map(|_| Arc::new(FrameMailbox::default()));
-    // Offer dmabuf ahead of shm (issue #507) only for a video session, only when
-    // the VAAPI import pipeline actually builds on this GPU, AND only when the
-    // forced-encoder choice can consume it — `software`/`vulkan` cannot, and
-    // offering dmabuf they can't import makes the first frame fail. The available()
-    // probe constructs a VAAPI device and filtergraph once here, so a machine that
-    // cannot import keeps the shm path with no per-recording cost.
+    // Offer dmabuf when the VAAPI import pipeline is available and the encoder
+    // selection can consume it. The importer scales oversized frames in VPP.
     let prefer_dmabuf = frames.is_some()
         && crate::dmabuf_import::available()
         && encoder::forced_allows_dmabuf(config.forced_encoder);
@@ -886,7 +882,14 @@ fn run<W: Write>(
             // its message is delivered after the stream-state one.
             Ok(Message::PointerButton(press_ms)) => {
                 if streaming_since.is_some_and(|since| press_ms >= since) {
-                    emit_sample(emitter, &cursor, content_rect(&capture, size), &mut pending_asset, Some(press_ms));
+                    emit_sample(
+                        emitter,
+                        &cursor,
+                        content_rect(&capture, size),
+                        capture.as_ref().filter(|capture| capture.started()).map(Capture::output_dimensions),
+                        &mut pending_asset,
+                        Some(press_ms),
+                    );
                 }
             }
 
@@ -1019,7 +1022,17 @@ fn run<W: Write>(
                                         video: selection.backend.as_str().to_owned(),
                                         rejected: selection.rejected,
                                     });
+                                    let output_dimensions = started.output_dimensions();
                                     capture = Some(started);
+                                    if (width, height) != output_dimensions {
+                                        let _ = emitter.emit(&Event::Warning {
+                                            code: "recording-resolution-scaled".to_owned(),
+                                            message: format!(
+                                                "the {}x{} capture exceeds the H.264 hardware limit; recording at {}x{}",
+                                                width, height, output_dimensions.0, output_dimensions.1
+                                            ),
+                                        });
+                                    }
                                     if paused {
                                         // A `pause` that arrived while the portal
                                         // picker was still up applies to the
@@ -1536,14 +1549,28 @@ fn run<W: Write>(
                 // A new sprite ships immediately; positions respect the sample
                 // interval so a 120fps compositor cannot flood stdout.
                 if asset_is_new || last_emit.elapsed() >= config.sample_interval {
-                    emit_sample(emitter, &cursor, content_rect(&capture, size), &mut pending_asset, None);
+                    emit_sample(
+                        emitter,
+                        &cursor,
+                        content_rect(&capture, size),
+                        capture.as_ref().filter(|capture| capture.started()).map(Capture::output_dimensions),
+                        &mut pending_asset,
+                        None,
+                    );
                     last_emit = Instant::now();
                 }
             }
 
             Err(RecvTimeoutError::Timeout) => {
                 if cursor.is_some() && last_emit.elapsed() >= config.sample_interval {
-                    emit_sample(emitter, &cursor, content_rect(&capture, size), &mut pending_asset, None);
+                    emit_sample(
+                        emitter,
+                        &cursor,
+                        content_rect(&capture, size),
+                        capture.as_ref().filter(|capture| capture.started()).map(Capture::output_dimensions),
+                        &mut pending_asset,
+                        None,
+                    );
                     last_emit = Instant::now();
                 }
                 // No advance here: a timeout means a tick has passed, so the
@@ -1657,16 +1684,19 @@ fn content_rect(capture: &Option<Capture>, size: Option<(i32, i32)>) -> Option<s
     }
 }
 
-/// Emits one cursor sample, positioned inside `content`.
-///
-/// `content` is the sub-rectangle of the stream the recording actually shows —
-/// [`Capture::content_rect`] once pixels are being encoded, the whole stream
-/// otherwise (a cursor-only session records no video of its own). The pointer
-/// arrives in STREAM pixels, so for a window stream it is measured from the
-/// corner of the monitor while the file starts at the corner of the window;
-/// subtracting the origin is what puts the two in the same space. The consumer
-/// normalises against the `width`/`height` reported here, so those must be the
-/// content's, not the stream's.
+fn cursor_recording_rect(capture: &Option<Capture>, size: Option<(i32, i32)>) -> Option<shim::CropRect> {
+    let content = content_rect(capture, size)?;
+    let (width, height) = capture
+        .as_ref()
+        .filter(|capture| capture.started())
+        .map(Capture::output_dimensions)
+        .unwrap_or((content.width, content.height));
+    Some(shim::CropRect { width, height, ..content })
+}
+
+
+/// Emits one cursor sample, positioned inside `content`. For downscaled captures,
+/// `output_dimensions` maps source-space pointer coordinates to the encoded frame.
 ///
 /// `click` is `Some(press_ms)` for a left-button press — the sample is then
 /// tagged `"click"` and stamped with that press time — or `None` for an ordinary
@@ -1676,17 +1706,21 @@ fn emit_sample<W: Write>(
     emitter: &mut Emitter<W>,
     cursor: &Option<CursorState>,
     content: Option<shim::CropRect>,
+    output_dimensions: Option<(i32, i32)>,
     pending_asset: &mut Option<CursorAsset>,
     click: Option<u64>,
 ) {
     let (Some(state), Some(content)) = (cursor, content) else {
         return;
     };
-    let (x, y) = (state.x - content.x, state.y - content.y);
+let (source_x, source_y) = (state.x - content.x, state.y - content.y);
+let (width, height) = output_dimensions.unwrap_or((content.width, content.height));
+let x = (i64::from(source_x) * i64::from(width) / i64::from(content.width.max(1))) as i32;
+let y = (i64::from(source_y) * i64::from(height) / i64::from(content.height.max(1))) as i32;
     // A pointer outside the recorded rectangle is REPORTED, not withheld: the
     // consumer clamps the position and carries `visible` so a renderer can hide
     // the sprite rather than pin it to an edge.
-    let visible = x >= 0 && y >= 0 && x < content.width && y < content.height;
+    let visible = x >= 0 && y >= 0 && x < width && y < height;
     // A click carries its own press time so the bounce lands when the button went
     // down, not up to a sample interval later; the position is the latest known,
     // which at the sample cadence has not moved enough to be wrong.
@@ -1698,8 +1732,8 @@ fn emit_sample<W: Write>(
         timestamp_ms: timestamp,
         x,
         y,
-        width: content.width,
-        height: content.height,
+        width,
+        height,
         visible,
         asset_id: state.asset_id.clone(),
         asset: pending_asset.take(),
@@ -1775,13 +1809,18 @@ fn resolve_microphone_node(label: &str, sources: &[shim::AudioSourceInfo]) -> Op
 mod cursor_sample_tests {
     use super::*;
 
-    fn sample_json(cursor: (i32, i32), content: Option<shim::CropRect>) -> serde_json::Value {
+    fn sample_json(
+        cursor: (i32, i32),
+        content: Option<shim::CropRect>,
+        output_dimensions: Option<(i32, i32)>,
+    ) -> serde_json::Value {
         let mut buffer = Vec::new();
         let mut emitter = Emitter::new(&mut buffer, false);
         emit_sample(
             &mut emitter,
             &Some(CursorState { x: cursor.0, y: cursor.1, asset_id: None }),
             content,
+            output_dimensions,
             &mut None,
             None,
         );
@@ -1796,6 +1835,7 @@ mod cursor_sample_tests {
         let value = sample_json(
             (960, 540),
             Some(shim::CropRect { x: 0, y: 0, width: 1920, height: 1080 }),
+            None,
         );
         assert_eq!(value["x"], 960);
         assert_eq!(value["y"], 540);
@@ -1818,12 +1858,22 @@ mod cursor_sample_tests {
         let value = sample_json(
             (260, 170),
             Some(shim::CropRect { x: 100, y: 50, width: 640, height: 480 }),
+            Some((320, 240)),
         );
-        assert_eq!(value["x"], 160, "the crop origin has to come off the position");
-        assert_eq!(value["y"], 120);
-        assert_eq!(value["width"], 640, "the consumer normalises against what it is told");
-        assert_eq!(value["height"], 480);
+        assert_eq!(value["x"], 80, "the crop origin is removed, then scaled to output");
+        assert_eq!(value["y"], 60);
+        assert_eq!(value["width"], 320, "the consumer normalises against encoded dimensions");
+        assert_eq!(value["height"], 240);
         assert_eq!(value["visible"], true);
+
+        let scaled = sample_json(
+            (500, 300),
+            Some(shim::CropRect { x: 100, y: 50, width: 640, height: 480 }),
+            Some((320, 240)),
+        );
+        assert_eq!(scaled["x"], 200);
+        assert_eq!(scaled["y"], 125);
+        assert_eq!(scaled["visible"], true);
     }
 
     /// Outside the window but still on the monitor. The old test was `x < width`
@@ -1835,6 +1885,7 @@ mod cursor_sample_tests {
         let outside = sample_json(
             (1500, 900),
             Some(shim::CropRect { x: 100, y: 50, width: 640, height: 480 }),
+            None,
         );
         assert_eq!(outside["visible"], false);
 
@@ -1843,6 +1894,7 @@ mod cursor_sample_tests {
         let before = sample_json(
             (10, 10),
             Some(shim::CropRect { x: 100, y: 50, width: 640, height: 480 }),
+            None,
         );
         assert_eq!(before["visible"], false);
     }
@@ -1857,6 +1909,7 @@ mod cursor_sample_tests {
         emit_sample(
             &mut emitter,
             &Some(CursorState { x: 10, y: 10, asset_id: None }),
+            None,
             None,
             &mut None,
             None,

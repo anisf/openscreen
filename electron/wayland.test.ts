@@ -12,6 +12,7 @@ describe("Wayland startup configuration", () => {
 			getSwitchValue: vi.fn(() => ""),
 		};
 		configureWaylandSupport(commandLine, env);
+		expect(commandLine.appendSwitch).toHaveBeenCalledWith("force-device-scale-factor", "1");
 		expect(commandLine.appendSwitch).toHaveBeenCalledWith("ozone-platform", "wayland");
 		expect(commandLine.appendSwitch).toHaveBeenCalledWith("disable-features", "Vulkan");
 	});
@@ -32,6 +33,24 @@ describe("Wayland startup configuration", () => {
 		expect(commandLine.appendSwitch).toHaveBeenCalledWith(
 			"enable-features",
 			"WaylandWindowDrag,WebRTCPipeWireCapturer",
+		);
+	});
+
+	it("preserves an explicitly configured device scale factor", () => {
+		const switches = new Map([
+			["force-device-scale-factor", "1.25"],
+			["ozone-platform", "wayland"],
+		]);
+		const commandLine = {
+			hasSwitch: (name: string) => switches.has(name),
+			getSwitchValue: (name: string) => switches.get(name) ?? "",
+			appendSwitch: vi.fn((name: string, value?: string) => switches.set(name, value ?? "")),
+		};
+		configureWaylandSupport(commandLine, { XDG_SESSION_TYPE: "wayland" });
+		expect(switches.get("force-device-scale-factor")).toBe("1.25");
+		expect(commandLine.appendSwitch).not.toHaveBeenCalledWith(
+			"force-device-scale-factor",
+			expect.anything(),
 		);
 	});
 

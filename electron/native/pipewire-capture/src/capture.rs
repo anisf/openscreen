@@ -236,6 +236,8 @@ pub struct Capture {
     /// window stream, so a resize travels down the crop and nothing else. The
     /// committed size is therefore the contract, and a later crop is read
     /// through it rather than replacing it.
+    source_width: i32,
+    source_height: i32,
     committed_width: i32,
     committed_height: i32,
     /// The rectangle of the SOURCE STREAM the encoder last read, in stream
@@ -285,7 +287,8 @@ impl Capture {
         // opened to consume the importer's NV12 pool directly (issue #507).
         dmabuf: Option<&shim::DmabufDesc>,
     ) -> Result<(Self, Selection), String> {
-        let bitrate = bitrate.unwrap_or_else(|| default_bitrate(width, height, fps));
+        let (output_width, output_height) = crate::encoder::h264_output_dimensions(width, height);
+        let bitrate = bitrate.unwrap_or_else(|| default_bitrate(output_width, output_height, fps));
         let mut rejected = Vec::new();
         // Shared with the negotiation offer (`prefer_dmabuf` in main) so the two
         // never disagree: offering dmabuf that this then refuses to import is what
@@ -311,6 +314,8 @@ impl Capture {
                     desc.height,
                     width,
                     height,
+                    output_width,
+                    output_height,
                     desc.drm_fourcc,
                 )?;
                 // SAFETY: the importer's device and NV12 frames context are live
@@ -318,7 +323,7 @@ impl Capture {
                 // alongside it below.
                 let encoder = unsafe {
                     VideoEncoder::open_importing(
-                        VideoParams { width, height, fps, bitrate },
+                        VideoParams { width: output_width, height: output_height, fps, bitrate },
                         importer.device(),
                         importer.output_frames_ctx(),
                     )?
@@ -327,7 +332,7 @@ impl Capture {
             }
             None => {
                 let encoder = VideoEncoder::open(
-                    VideoParams { width, height, fps, bitrate },
+                    VideoParams { width: output_width, height: output_height, fps, bitrate },
                     forced,
                     |backend, error| rejected.push(format!("{}: {error}", backend.as_str())),
                 )?;
@@ -378,8 +383,10 @@ impl Capture {
                 paused_at: None,
                 next_index: 0,
                 frames_written: 0,
-                committed_width: width,
-                committed_height: height,
+                source_width: width,
+                source_height: height,
+                committed_width: output_width,
+                committed_height: output_height,
                 content: shim::CropRect { x: 0, y: 0, width, height },
             },
             selection,
@@ -396,8 +403,8 @@ impl Capture {
         // down to even for H.264 chroma, so a window sitting stably at 321x241
         // commits 320x240 and would otherwise be reported as resized on every
         // single frame — a warning about a window that never moved.
-        (frame.crop.width & !1) != self.committed_width
-            || (frame.crop.height & !1) != self.committed_height
+        (frame.crop.width & !1) != self.source_width
+            || (frame.crop.height & !1) != self.source_height
     }
 
     /// Where to start reading this frame, in source pixels.
@@ -407,8 +414,8 @@ impl Capture {
     /// clamp is the only thing standing between a shrunken window and an
     /// out-of-bounds read inside swscale.
     fn read_origin(&self, frame: &shim::Frame) -> (i32, i32) {
-        let max_x = (frame.width - self.committed_width).max(0);
-        let max_y = (frame.height - self.committed_height).max(0);
+        let max_x = (frame.width - self.source_width).max(0);
+        let max_y = (frame.height - self.source_height).max(0);
         (
             frame.crop.x.clamp(0, max_x),
             frame.crop.y.clamp(0, max_y),
@@ -454,8 +461,8 @@ impl Capture {
         self.content = shim::CropRect {
             x,
             y,
-            width: self.committed_width,
-            height: self.committed_height,
+            width: self.source_width,
+            height: self.source_height,
         };
 
         // Zero-copy dmabuf path: import the tiled GPU buffer into an NV12 VAAPI
@@ -512,7 +519,13 @@ impl Capture {
             .get(offset..)
             .ok_or_else(|| format!("crop offset {offset} is past the end of the frame"))?;
 
-        self.encoder.stage(pixels, frame.stride, format)?;
+        self.encoder.stage_sized(
+            pixels,
+            frame.stride,
+            format,
+            self.source_width,
+            self.source_height,
+        )?;
         self.mark_started();
         Ok(StageOutcome::Staged)
     }
@@ -546,6 +559,10 @@ impl Capture {
     /// The source rectangle the file is showing. See [`Self::content`].
     pub fn content_rect(&self) -> shim::CropRect {
         self.content
+    }
+
+    pub fn output_dimensions(&self) -> (i32, i32) {
+        (self.committed_width, self.committed_height)
     }
 
     /// Stamps the staged picture at the wall clock's current frame index and

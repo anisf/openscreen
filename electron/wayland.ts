@@ -25,6 +25,12 @@ export function usesWaylandBackend(
 /** Prefer Wayland in a Wayland session, while respecting an explicit backend. */
 export function configureWaylandSupport(commandLine: CommandLine, env: Env): void {
 	if (!isWaylandSession(env)) return;
+	// Match Chromium's CSS pixel size to the compositor's Wayland surface size.
+	// A desktop text-scaling factor below 1 otherwise draws the HUD smaller than
+	// its native window, leaving transparent gaps on the right and bottom.
+	if (!commandLine.hasSwitch("force-device-scale-factor")) {
+		commandLine.appendSwitch("force-device-scale-factor", "1");
+	}
 	if (!commandLine.hasSwitch("ozone-platform")) {
 		commandLine.appendSwitch("ozone-platform", "wayland");
 	}

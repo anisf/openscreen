@@ -486,15 +486,13 @@ export function createHudOverlayWindow(): BrowserWindow {
 	const { workArea } = primaryDisplay;
 
 	// Close to what the renderer asks for on its very first measurement, so the HUD
-	// doesn't visibly resize itself the instant it becomes visible. Windows and macOS
-	// ask for the bar plus the reserved space above it; Linux hugs the bar (the HUD
-	// is not click-through there, so a reserve would swallow desktop clicks until the
-	// first measurement). See src/components/launch/hudGeometry.ts.
-	// Wayland is the exception: the HUD cannot move its window there, so it keeps the reserve.
+	// doesn't visibly resize itself the instant it becomes visible. Linux keeps only
+	// a compact Wayland reserve; the full settings panel can grow the window when opened.
+	// See src/components/launch/hudGeometry.ts.
 	const isLinux = process.platform === "linux";
 	const wayland = usesWaylandBackend(process.platform, app.commandLine, process.env);
 	const windowWidth = isLinux ? 600 : 820;
-	const windowHeight = isLinux && !wayland ? 190 : 560;
+	const windowHeight = isLinux ? 190 : 560;
 
 	const x = Math.floor(workArea.x + (workArea.width - windowWidth) / 2);
 	const y = Math.floor(workArea.y + workArea.height - windowHeight - 5);
@@ -504,8 +502,10 @@ export function createHudOverlayWindow(): BrowserWindow {
 		height: windowHeight,
 		// Min/max are intentionally loose: the renderer resizes to fit content via
 		// "hud-overlay-set-size" (above), needed for the vertical tray to grow taller.
-		minWidth: HUD_WINDOW_MIN.width,
-		minHeight: HUD_WINDOW_MIN.height,
+		// Linux sizes the window to exactly the visible HUD; a larger native minimum would leave a
+		// transparent strip that still takes input (the Linux HUD is not click-through).
+		minWidth: isLinux ? 1 : HUD_WINDOW_MIN.width,
+		minHeight: isLinux ? 1 : HUD_WINDOW_MIN.height,
 		// The reserve may overhang the screen (hudWindowBounds.ts). Without this, macOS
 		// re-constrains the frame below the menu bar whenever the window is re-ordered,
 		// pulling a stack parked at the top down by the whole reserve.
@@ -514,12 +514,12 @@ export function createHudOverlayWindow(): BrowserWindow {
 		y: y,
 		frame: false,
 		transparent: true,
-		// Fully-transparent ARGB backing. Without this macOS draws the window as a
-		// rounded glass panel with a border around the HUD content.
+		// Fully-transparent ARGB backing. The Linux window hugs the rounded HUD surface,
+		// so clip its transparent viewport to matching rounded corners; otherwise a tiny
+		// rectangular frame remains visible beyond the bar. Other platforms keep their
+		// existing native corner behavior.
 		backgroundColor: "#00000000",
-		// Don't let macOS mask the window into a rounded rect; the HUD bar provides
-		// its own rounding and the window itself must be invisible.
-		roundedCorners: false,
+		roundedCorners: isLinux,
 		resizable: false,
 		alwaysOnTop: true,
 		skipTaskbar: true,

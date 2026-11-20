@@ -13,6 +13,7 @@ import {
 	HUD_BAR_BOTTOM,
 	HUD_EDGE_SLACK,
 	HUD_GROWTH_RESERVE,
+	HUD_LINUX_FLOATING_MAX_HEIGHT,
 	HUD_MODAL_MAX_HEIGHT,
 	HUD_POPOVER_GAP,
 	HUD_POPOVER_MAX_HEIGHT,
@@ -22,7 +23,6 @@ import {
 	HUD_TOAST_LIFT,
 	HUD_TOAST_VISIBLE,
 	HUD_TOAST_WIDTH,
-	HUD_TOOLTIP_STACK_HEIGHT,
 	HUD_UNREPORTED_PANELS_ALLOWANCE,
 	hudGrowthReserve,
 } from "./hudGeometry";
@@ -64,7 +64,7 @@ describe("computeHudWindowSize", () => {
 		expect(granted.height).toBe(required.height + HUD_GROWTH_RESERVE);
 	});
 
-	it("hugs the required size when the reserve is zero", () => {
+	it("hugs measured Linux content width when the reserve is zero", () => {
 		const { required, granted } = computeHudWindowSize({
 			barWidth: 520,
 			barHeight: 48,
@@ -73,7 +73,8 @@ describe("computeHudWindowSize", () => {
 			stackMaxHeight: HUD_MODAL_MAX_HEIGHT,
 			growthReserve: 0,
 		});
-		expect(granted).toEqual(required);
+		expect(required.width).toBe(520);
+		expect(granted.width).toBe(required.width);
 	});
 
 	it("counts a visible toast in the window height", () => {
@@ -104,7 +105,7 @@ describe("computeHudWindowSize", () => {
 		});
 		// No popover gap or panel reserve of its own: the measured height already
 		// includes the gap to the bar.
-		expect(required.height).toBe(HUD_BAR_BOTTOM + 56 + 308 + HUD_EDGE_SLACK);
+		expect(required.height).toBe(56 + 308);
 	});
 
 	it("does not count a notice twice when the open stack is measured", () => {
@@ -142,9 +143,18 @@ describe("computeHudWindowSize", () => {
 		);
 	});
 
-	it("reserves room for the widest floating panel even when the bar is narrow", () => {
-		const { required } = size(48, 520);
-		expect(required.width).toBeGreaterThanOrEqual(HUD_STACK_WIDTH + HUD_EDGE_SLACK * 2);
+	it("reserves room for a hidden floating panel only when width hysteresis is enabled", () => {
+		const ordinary = size(48, 520).required;
+		const compactLinux = computeHudWindowSize({
+			barWidth: 48,
+			barHeight: 520,
+			noticeHeight: 0,
+			availableHeight: SCREEN,
+			stackMaxHeight: HUD_MODAL_MAX_HEIGHT,
+			growthReserve: 0,
+		});
+		expect(ordinary.width).toBeGreaterThanOrEqual(HUD_STACK_WIDTH + HUD_EDGE_SLACK * 2);
+		expect(compactLinux.required.width).toBe(48);
 	});
 
 	it("absorbs bar growth without needing a bigger window", () => {
@@ -171,82 +181,38 @@ describe("computeHudWindowSize", () => {
 });
 
 describe("computeHudLinuxStack", () => {
-	// The Linux path of LaunchWindow's measureHudSize: a 567x56 bar on a 1080p GNOME display,
-	// with `open` the measured stack above the bar (gap included).
+	// The Linux path of LaunchWindow's measureHudSize: a 567x56 bar, with `open` the measured
+	// stack above the bar (gap included).
 	const BAR = { width: 567, height: 56 };
 	const available = computeHudAvailableHeight({ availHeight: SCREEN, height: SCREEN }, "linux");
-	const popoverMax = computeHudPopoverMaxHeight(BAR.height, available);
-	const modalMax = computeHudModalMaxHeight(BAR.height, available);
-	function linuxWindow(wayland: boolean, open: number, toastsHeight = 0) {
-		const stack = computeHudLinuxStack({
-			wayland,
-			openStackHeight: open,
-			toastsHeight,
-			reserveHeight: HUD_POPOVER_GAP + Math.max(popoverMax, modalMax),
-		});
+	const modalMax = computeHudModalMaxHeight(BAR.height, available, HUD_LINUX_FLOATING_MAX_HEIGHT);
+	function linuxWindow(open: number, toastsHeight = 0) {
+		const stack = computeHudLinuxStack({ openStackHeight: open, toastsHeight });
 		return computeHudWindowSize({
 			barWidth: BAR.width,
 			barHeight: BAR.height,
 			noticeHeight: 0,
 			availableHeight: available,
-			stackMaxHeight: Math.max(popoverMax, modalMax),
+			stackMaxHeight: modalMax,
 			growthReserve: 0,
 			...stack,
 		}).granted;
 	}
-	const collapsed = 0;
-	const languageMenu = HUD_POPOVER_GAP + popoverMax;
-	const deviceSettings = HUD_POPOVER_GAP + modalMax;
 
-	it("keeps the Wayland window one size whatever opens, so the bar never moves", () => {
-		// Mutter keeps a resized window's top-left corner, so any change of height moves the
-		// bottom-anchored bar by that much (the v2.3.0-rc.1 GNOME Wayland regression).
-		const sizes = [
-			linuxWindow(true, collapsed),
-			linuxWindow(true, languageMenu),
-			linuxWindow(true, deviceSettings),
-			linuxWindow(true, collapsed, 64),
-			linuxWindow(true, languageMenu, 64),
-			linuxWindow(true, deviceSettings, 64),
-		];
-		for (const s of sizes) expect(s).toEqual(sizes[0]);
-		expect(sizes[0].height).toBe(HUD_BAR_BOTTOM + BAR.height + deviceSettings + HUD_EDGE_SLACK);
+	it("is exactly the bar while idle: no empty room on any side", () => {
+		expect(linuxWindow(0)).toEqual({ width: BAR.width, height: BAR.height });
 	});
 
-	it("still hugs the visible stack on X11, which can move the window back", () => {
-		const bar = linuxWindow(false, collapsed);
-		expect(bar.height).toBe(
-			HUD_BAR_BOTTOM + BAR.height + HUD_TOOLTIP_STACK_HEIGHT + HUD_EDGE_SLACK,
+	it("grows only by what is actually open above the bar", () => {
+		const deviceSettings = HUD_POPOVER_GAP + modalMax;
+		expect(linuxWindow(deviceSettings).height).toBe(BAR.height + deviceSettings);
+		expect(linuxWindow(0, 64).height).toBe(BAR.height + HUD_STACK_GAP + 64);
+		// A toast sits on top of the open stack, inside the window.
+		const stack = computeHudLinuxStack({ openStackHeight: deviceSettings, toastsHeight: 64 });
+		expect(stack.toastLift).toBe(deviceSettings);
+		expect(computeHudToastBottom(BAR.height + stack.toastLift, 0) + 64).toBeLessThanOrEqual(
+			linuxWindow(deviceSettings, 64).height,
 		);
-		expect(linuxWindow(false, deviceSettings).height).toBe(
-			HUD_BAR_BOTTOM + BAR.height + deviceSettings + HUD_EDGE_SLACK,
-		);
-		expect(linuxWindow(false, collapsed, 64).height).toBe(bar.height + HUD_STACK_GAP + 64);
-	});
-
-	it("keeps a toast inside the Wayland window, over the top of a full-height panel", () => {
-		const toasts = 64;
-		const reserve = HUD_POPOVER_GAP + Math.max(popoverMax, modalMax);
-		const lift = (open: number) =>
-			computeHudLinuxStack({
-				wayland: true,
-				openStackHeight: open,
-				toastsHeight: toasts,
-				reserveHeight: reserve,
-			}).toastLift;
-		// Above the bar, or above a short panel, the toast sits where it does elsewhere.
-		expect(lift(collapsed)).toBe(collapsed);
-		expect(lift(languageMenu)).toBe(languageMenu);
-		// Above Device settings it would leave the window: it overlaps the panel's top instead.
-		const window = linuxWindow(true, deviceSettings, toasts);
-		const toastTop = computeHudToastBottom(BAR.height + lift(deviceSettings)) + toasts;
-		expect(lift(deviceSettings)).toBeLessThan(deviceSettings);
-		expect(toastTop).toBeLessThanOrEqual(window.height - HUD_EDGE_SLACK);
-	});
-
-	it("grows on Wayland only when the stack outgrows the reserve", () => {
-		const reserve = linuxWindow(true, collapsed).height;
-		expect(linuxWindow(true, deviceSettings + 40).height).toBe(reserve + 40);
 	});
 });
 

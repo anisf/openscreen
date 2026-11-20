@@ -1,7 +1,7 @@
 /**
  * Geometry for the HUD overlay window.
  *
- * The HUD lives in a transparent, click-through BrowserWindow whose size the
+ * The HUD lives in a transparent overlay BrowserWindow whose size the
  * renderer drives over IPC. The old approach *discovered* the size it needed by
  * measuring whatever happened to be on screen and growing to fit, which closed a
  * feedback loop: a native resize changes the viewport, viewport-sized elements
@@ -16,13 +16,12 @@
  * Opening or closing a popover, or a device list changing length, then costs
  * exactly zero native resizes.
  *
- * Linux is the exception, and has to be: the HUD there cannot be made
- * click-through (see LaunchWindow.tsx), so reserve the bar does not need is a
- * transparent rectangle that intercepts desktop clicks. Its window follows the
- * measured stack instead — `openStackHeight` below — and resizes as a panel opens
- * or closes. Only on X11, though: a Wayland window cannot move itself, so it keeps
- * the reserve (`computeHudLinuxStack`). Tooltips are the one floating thing no measurement sees, so they get
- * a fixed floor (`HUD_TOOLTIP_STACK_HEIGHT`).
+ * Linux is the exception: the HUD there cannot be made click-through (see LaunchWindow.tsx),
+ * so any transparent area beyond the bar and the panel currently open intercepts desktop
+ * clicks. On X11, the window follows the measured stack and resizes as panels open and close.
+ * Wayland cannot move the window itself, so it keeps a compact reserve (`computeHudLinuxStack`)
+ * and clips panels to fit inside it. Tooltips are the one floating thing no measurement sees,
+ * so they get a fixed floor (`HUD_TOOLTIP_STACK_HEIGHT`).
  *
  * Nothing here may depend on `window.innerWidth/innerHeight`: that is the edge
  * the loop used to close on. Screen-derived values (`screen.availHeight`) are
@@ -72,6 +71,8 @@ export const HUD_POPOVER_MIN_HEIGHT = 140;
  */
 export const HUD_MODAL_MAX_HEIGHT = 470;
 export const HUD_MODAL_MIN_HEIGHT = 200;
+/** Wayland keeps a scrollable panel reserve while idle; cap that transparent hit area. */
+export const HUD_LINUX_FLOATING_MAX_HEIGHT = 240;
 /**
  * Slack granted *beyond* what is strictly required, on each axis. This is pure
  * hysteresis: the bar can grow by this much (recording controls appearing, a
@@ -82,7 +83,7 @@ export const HUD_GROWTH_RESERVE = 120;
 /**
  * Growth reserve for a platform. Zero on Linux: there the HUD is not click-through
  * (see `setHudMouseEventsEnabled`), and a Wayland compositor treats the whole
- * toplevel as the window's allocation, so reserve the bar does not need is a large
+ * toplevel as the window's allocation, so reserving more than needed leaves a large
  * transparent rectangle that still takes input — a dead zone around the bar rather
  * than the Windows/macOS overhang, which passes clicks through.
  *
@@ -94,41 +95,27 @@ export function hudGrowthReserve(platform: string): number {
 	return platform === "linux" ? 0 : HUD_GROWTH_RESERVE;
 }
 /**
- * What the Linux HUD asks room for above the bar, as `openStackHeight` and `toastsHeight`
- * for `computeHudWindowSize`.
- *
- * X11 hugs the measured stack: the window grows when a panel opens and the main process
- * moves it so the bar stays where it was. Wayland cannot do that. A client there can
- * neither set nor read its toplevel's position, and mutter keeps the top-left corner of a
- * window that resizes, so a window growing by a panel's height pushed the bottom-anchored
- * bar down by that height, under the dock or off screen, for as long as the panel was open
- * (v2.3.0-rc.1). On Wayland the window therefore keeps room for the tallest panel at all
- * times, `reserveHeight`, and fits the toasts inside it, so opening a panel or showing a
- * toast never resizes it. A toast that does not fit above an open panel overlaps the panel's
- * top instead: `toastLift` is the stack height the toasts sit on. That room still takes
- * clicks: the price of a bar that holds still.
+ * Gap under the bar. Zero on Linux, for the same reason as `hudGrowthReserve`: a margin
+ * there is transparent area that still takes input.
+ */
+export function hudBarBottom(platform: string): number {
+	return platform === "linux" ? 0 : HUD_BAR_BOTTOM;
+}
+/**
+ * Linux has no click-through overlay, so it asks only for visible content. Wayland cannot
+ * position its toplevel, therefore a resize can move the HUD with the compositor's anchor;
+ * retaining invisible panel or tooltip space is worse because it also captures input.
  */
 export function computeHudLinuxStack(input: {
-	wayland: boolean;
 	/** Measured stack above the bar (gap, open panel, notices), 0 when nothing is open. */
 	openStackHeight: number;
 	toastsHeight: number;
-	/** Gap plus the tallest panel's cap: what the window keeps above the bar on Wayland. */
-	reserveHeight: number;
 }): { openStackHeight: number; toastsHeight: number; toastLift: number } {
-	if (!input.wayland) {
-		return {
-			openStackHeight: Math.max(HUD_TOOLTIP_STACK_HEIGHT, input.openStackHeight),
-			toastsHeight: input.toastsHeight,
-			toastLift: input.openStackHeight,
-		};
-	}
-	const toastBlock = input.toastsHeight > 0 ? HUD_STACK_GAP + Math.ceil(input.toastsHeight) : 0;
-	const openStackHeight = Math.max(input.reserveHeight, input.openStackHeight);
+	const openStackHeight = Math.max(0, input.openStackHeight);
 	return {
 		openStackHeight,
-		toastsHeight: 0,
-		toastLift: Math.max(0, Math.min(input.openStackHeight, openStackHeight - toastBlock)),
+		toastsHeight: input.toastsHeight,
+		toastLift: openStackHeight,
 	};
 }
 /** Floor for the window itself, in case the bar measures as ~nothing. */
@@ -204,15 +191,23 @@ function stackRoom(barHeight: number, availableHeight: number): number {
  * can be several hundred pixels tall, so on a short screen the popover has to
  * give way rather than push the window off the top of the display.
  */
-export function computeHudPopoverMaxHeight(barHeight: number, availableHeight: number): number {
+export function computeHudPopoverMaxHeight(
+	barHeight: number,
+	availableHeight: number,
+	maxHeight = HUD_POPOVER_MAX_HEIGHT,
+): number {
 	const room = stackRoom(barHeight, availableHeight);
-	return Math.round(Math.min(HUD_POPOVER_MAX_HEIGHT, Math.max(HUD_POPOVER_MIN_HEIGHT, room)));
+	return Math.round(Math.min(maxHeight, Math.max(HUD_POPOVER_MIN_HEIGHT, room)));
 }
 
 /** Same, for the taller device-settings panel. */
-export function computeHudModalMaxHeight(barHeight: number, availableHeight: number): number {
+export function computeHudModalMaxHeight(
+	barHeight: number,
+	availableHeight: number,
+	maxHeight = HUD_MODAL_MAX_HEIGHT,
+): number {
 	const room = stackRoom(barHeight, availableHeight);
-	return Math.round(Math.min(HUD_MODAL_MAX_HEIGHT, Math.max(HUD_MODAL_MIN_HEIGHT, room)));
+	return Math.round(Math.min(maxHeight, Math.max(HUD_MODAL_MIN_HEIGHT, room)));
 }
 
 /** Tallest the bar itself is allowed to get before it scrolls internally. */
@@ -238,8 +233,14 @@ export function computeHudWindowSize(input: HudSizeInput): {
 	required: HudSize;
 	granted: HudSize;
 } {
-	const stackWidth = Math.max(Math.ceil(input.barWidth), HUD_STACK_WIDTH);
-	const requiredWidth = Math.max(HUD_MIN_WINDOW_WIDTH, stackWidth + HUD_EDGE_SLACK * 2);
+	const measuredWidth = Math.ceil(input.barWidth);
+	const requiredWidth =
+		input.growthReserve === 0
+			? Math.max(1, measuredWidth)
+			: Math.max(
+					HUD_MIN_WINDOW_WIDTH,
+					Math.max(measuredWidth, HUD_STACK_WIDTH) + HUD_EDGE_SLACK * 2,
+				);
 
 	const noticeBlock = input.noticeHeight > 0 ? HUD_STACK_GAP + Math.ceil(input.noticeHeight) : 0;
 	// Toasts float above the whole stack, so they need room whenever one is on
@@ -255,8 +256,15 @@ export function computeHudWindowSize(input: HudSizeInput): {
 		input.openStackHeight !== undefined
 			? Math.max(0, Math.ceil(input.openStackHeight))
 			: HUD_POPOVER_GAP + Math.ceil(input.stackMaxHeight) + noticeBlock;
+	// A zero growth reserve is the Linux HUD, which is not click-through: there the window
+	// is exactly what is visible, with no edge slack and no margin under the bar.
+	const compact = input.growthReserve === 0;
 	const rawHeight =
-		HUD_BAR_BOTTOM + Math.ceil(input.barHeight) + stackBlock + toastBlock + HUD_EDGE_SLACK;
+		(compact ? 0 : HUD_BAR_BOTTOM) +
+		Math.ceil(input.barHeight) +
+		stackBlock +
+		toastBlock +
+		(compact ? 0 : HUD_EDGE_SLACK);
 
 	// The main process clamps the whole window to the work area on Linux, so clamp here too:
 	// otherwise the caller would record an allocation the window never actually
@@ -290,8 +298,8 @@ export const HUD_TOAST_VISIBLE = 3;
  * long as the user was reaching for the controls under it (#1149). Above the stack is the
  * reserve the window keeps for floating surfaces anyway, in either orientation.
  */
-export function computeHudToastBottom(stackHeight: number): number {
-	return HUD_BAR_BOTTOM + Math.ceil(stackHeight) + HUD_STACK_GAP;
+export function computeHudToastBottom(stackHeight: number, barBottom = HUD_BAR_BOTTOM): number {
+	return barBottom + Math.ceil(stackHeight) + HUD_STACK_GAP;
 }
 
 /**

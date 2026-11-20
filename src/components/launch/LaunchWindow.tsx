@@ -54,9 +54,10 @@ import {
 	computeHudToastBottom,
 	computeHudToastsHeight,
 	computeHudWindowSize,
-	HUD_BAR_BOTTOM,
+	HUD_LINUX_FLOATING_MAX_HEIGHT,
 	HUD_POPOVER_GAP,
 	HUD_STACK_GAP,
+	hudBarBottom,
 	hudGrowthReserve,
 } from "./hudGeometry";
 import styles from "./LaunchWindow.module.css";
@@ -433,7 +434,7 @@ export function LaunchWindow() {
 	useLayoutEffect(() => {
 		const anchor = hudAnchorRef.current;
 		if (!anchor) return;
-		anchor.style.setProperty("--hud-bar-bottom", `${HUD_BAR_BOTTOM}px`);
+		anchor.style.setProperty("--hud-bar-bottom", `${hudBarBottom(getPlatform())}px`);
 		anchor.style.setProperty("--hud-popover-gap", `${HUD_POPOVER_GAP}px`);
 		anchor.style.setProperty("--hud-stack-gap", `${HUD_STACK_GAP}px`);
 		anchor.style.setProperty("--hud-bar-max-h", hudBarMaxHeightCss());
@@ -448,6 +449,9 @@ export function LaunchWindow() {
 		if (isDraggingHudRef.current) return;
 
 		const availableHeight = getAvailableScreenHeight();
+		const platform = getPlatform();
+		const isLinux = platform === "linux";
+		const wayland = isLinux && IS_WAYLAND_HUD;
 		const barRect = barEl.getBoundingClientRect();
 		const barWidth = barRect.width || barEl.scrollWidth;
 		const barHeight = barRect.height || barEl.scrollHeight;
@@ -466,8 +470,13 @@ export function LaunchWindow() {
 		// architecture exists to remove. Linux cannot afford that reserve: its HUD is
 		// not click-through, so the empty space intercepts desktop clicks whenever no
 		// panel is open. There the window follows the measured stack instead.
-		const popoverMaxHeight = computeHudPopoverMaxHeight(barHeight, availableHeight);
-		const modalMaxHeight = computeHudModalMaxHeight(barHeight, availableHeight);
+		const linuxSurfaceCap = isLinux && wayland ? HUD_LINUX_FLOATING_MAX_HEIGHT : undefined;
+		const popoverMaxHeight = computeHudPopoverMaxHeight(
+			barHeight,
+			availableHeight,
+			linuxSurfaceCap,
+		);
+		const modalMaxHeight = computeHudModalMaxHeight(barHeight, availableHeight, linuxSurfaceCap);
 		const anchorEl = hudAnchorRef.current;
 		anchorEl?.style.setProperty("--hud-popover-max-h", `${popoverMaxHeight}px`);
 		anchorEl?.style.setProperty("--hud-modal-max-h", `${modalMaxHeight}px`);
@@ -479,18 +488,20 @@ export function LaunchWindow() {
 		const stackRect = anchorRect?.width && anchorRect.height ? anchorRect : barRect;
 		const stackHeight = stackRect.height || barHeight;
 
-		const platform = getPlatform();
-		const isLinux = platform === "linux";
 		const growthReserve = hudGrowthReserve(platform);
 		const toastsHeight = hudToastsHeightRef.current;
 		const linuxStack = computeHudLinuxStack({
-			wayland: IS_WAYLAND_HUD,
 			openStackHeight: stackHeight - barHeight,
 			toastsHeight,
-			reserveHeight: HUD_POPOVER_GAP + Math.max(popoverMaxHeight, modalMaxHeight),
 		});
+		// Linux has no width reserve, so the window must be as wide as what is visible now: the
+		// bar, or an open panel or toast wider than it (a vertical bar is far narrower than both).
+		const visible = addHudToastsToStack(
+			{ width: stackRect.width || barWidth, height: stackHeight },
+			toastsHeight,
+		);
 		const { required, granted } = computeHudWindowSize({
-			barWidth,
+			barWidth: isLinux ? Math.max(barWidth, visible.width) : barWidth,
 			barHeight,
 			// On Linux the measured stack already contains any notice, so counting the
 			// notice again would reserve its height twice.
@@ -531,15 +542,14 @@ export function LaunchWindow() {
 		// Toasts sit above the stack, and they are just as visible: a toast pushed off the top
 		// of the screen is an error nobody reads.
 		setHudToastBottom(
-			computeHudToastBottom(isLinux ? barHeight + linuxStack.toastLift : stackHeight),
-		);
-		const visible = addHudToastsToStack(
-			{ width: stackRect.width || barWidth, height: stackHeight },
-			toastsHeight,
+			computeHudToastBottom(
+				isLinux ? barHeight + linuxStack.toastLift : stackHeight,
+				hudBarBottom(platform),
+			),
 		);
 		const contentFor = (size: { width: number; height: number }) => ({
 			x: (size.width - visible.width) / 2,
-			y: size.height - HUD_BAR_BOTTOM - visible.height,
+			y: size.height - hudBarBottom(platform) - visible.height,
 			width: visible.width,
 			height: visible.height,
 		});
